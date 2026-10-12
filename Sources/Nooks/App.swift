@@ -281,7 +281,8 @@ private final class HoverSwitcher {
     }
 
     private func show(on screen: NSScreen) {
-        guard !expanded else { return }
+        // macOS can order the panel out behind our back (sleep, display change), leaving expanded stuck true.
+        guard !expanded || !panel.isVisible else { return }
         expanded = true
         let islandWidth = max(160, (screen.auxiliaryTopRightArea?.minX ?? 0) - (screen.auxiliaryTopLeftArea?.maxX ?? 0))
         let islandHeight = max(32, screen.safeAreaInsets.top)
