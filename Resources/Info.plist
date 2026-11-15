@@ -20,6 +20,8 @@
 	<string>13.0</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSSupportsAppNap</key>
+	<false/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 </dict>

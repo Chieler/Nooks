@@ -6,3 +6,4 @@ dist/
 skills-lock.json
 spaced.png
 .swiftpm/
+.serena/

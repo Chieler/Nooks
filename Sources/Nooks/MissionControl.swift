@@ -26,10 +26,23 @@ final class MissionControl {
     }
 
     func switchTo(_ desktop: Desktop, model: SpaceModel) {
+        NSLog("[MissionControl] switchTo desktop id=%llu, isCurrent=%d, model.busy=%d",
+              desktop.id, desktop.isCurrent ? 1 : 0, model.busy ? 1 : 0)
         guard !model.busy else { return }
         guard AX.trusted else { model.message = "Enable Accessibility to switch Spaces."; return }
         guard model.revealAll() else { return }
         if desktop.isCurrent { model.message = "Already on \(model.name(desktop))."; return }
+
+        // Fast instant switch via SpaceSwitcher (invisible helper window / direct app activation)
+        if SpaceSwitcher.shared.switchTo(desktop: desktop, allDesktops: model.desktops) {
+            model.message = "Switched to \(model.name(desktop))."
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak model] in
+                model?.refreshSpaces()
+            }
+            return
+        }
+
+        // Fallback to Mission Control Dock accessibility if fast switch is unavailable
         model.busy = true
         guard open() else {
             model.busy = false

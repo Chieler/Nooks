@@ -221,17 +221,68 @@ final class IslandState: ObservableObject {
     @Published var isPresented = false
 }
 
-private final class HoverSwitcher {
+final class IslandWakeRecovery {
+    private let notificationCenter: NotificationCenter
+    private let appNotificationCenter: NotificationCenter
+    private var observers: [NSObjectProtocol] = []
+    var onWake: (() -> Void)?
+    var onSleep: (() -> Void)?
+
+    init(panel: NSPanel,
+         notificationCenter: NotificationCenter = NSWorkspace.shared.notificationCenter,
+         appNotificationCenter: NotificationCenter = NotificationCenter.default,
+         onWake: (() -> Void)? = nil,
+         onSleep: (() -> Void)? = nil) {
+        self.notificationCenter = notificationCenter
+        self.appNotificationCenter = appNotificationCenter
+        self.onWake = onWake
+        self.onSleep = onSleep
+
+        // When macOS prepares to sleep, order out immediately to prevent stale Space attachment
+        observers.append(notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak panel, weak self] _ in
+            panel?.orderOut(nil)
+            self?.onSleep?()
+        })
+
+        // When system wakes or screens wake
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            observers.append(notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak panel, weak self] _ in
+                // AppKit may still report a panel as visible when its Space attachment is stale.
+                panel?.orderOut(nil)
+                self?.onWake?()
+            })
+        }
+
+        // When screen configuration changes (display wakes, resolution changes, or external monitor plugged/unplugged)
+        observers.append(appNotificationCenter.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak panel, weak self] _ in
+            panel?.orderOut(nil)
+            self?.onWake?()
+        })
+    }
+
+    deinit {
+        for observer in observers {
+            notificationCenter.removeObserver(observer)
+            appNotificationCenter.removeObserver(observer)
+        }
+    }
+}
+
+final class HoverSwitcher {
     private let model: SpaceModel
-    private let panel: NSPanel
+    let panel: NSPanel
     private var timer: Timer?
+    private var mouseMonitor: Any?
     private var hideAfter: Date?
     private var animationID = 0
-    private var expanded = false
-    private let state = IslandState()
+    private(set) var expanded = false
+    let state = IslandState()
+    private var wakeRecovery: IslandWakeRecovery?
+    private let mission: MissionControl
 
     init(model: SpaceModel, mission: MissionControl) {
         self.model = model
+        self.mission = mission
         let panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         self.panel = panel
         panel.level = .statusBar
@@ -240,59 +291,163 @@ private final class HoverSwitcher {
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.hidesOnDeactivate = false
-        panel.contentView = NSHostingView(rootView: IslandSwitcher(model: model, state: state, mission: mission) { [weak self] in
-            self?.hide()
+        panel.contentView = NSHostingView(rootView: IslandSwitcher(model: model, state: state, mission: mission) { [weak self] desktop in
+            self?.selectDesktop(desktop)
         })
+
+        self.wakeRecovery = IslandWakeRecovery(
+            panel: panel,
+            onWake: { [weak self] in self?.handleWakeOrScreenChange() },
+            onSleep: { [weak self] in self?.handleSleep() }
+        )
+    }
+
+    deinit {
+        stop()
     }
 
     func start() {
-        let timer = Timer(timeInterval: 0.016, repeats: true) { [weak self] _ in self?.update() }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+        if let screen = currentScreen() {
+            panel.setFrame(compactFrame(for: screen), display: true)
+            panel.orderFrontRegardless()
+        }
+        restartTracking()
     }
 
-    private func update() {
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        if let monitor = mouseMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseMonitor = nil
+        }
+    }
+
+    func restartTracking() {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 0.033, repeats: true) { [weak self] _ in self?.update() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+
+        if mouseMonitor == nil {
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged]) { [weak self] event in
+                self?.handleGlobalMouseMove(event)
+            }
+        }
+    }
+
+    func currentScreen() -> NSScreen? {
         let point = NSEvent.mouseLocation
-        guard let screen = NSScreen.screens.first(where: {
+        return NSScreen.screens.first(where: {
             point.x >= $0.frame.minX && point.x <= $0.frame.maxX &&
             point.y >= $0.frame.minY && point.y <= $0.frame.maxY + 10
-        }) ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        }) ?? NSScreen.main ?? NSScreen.screens.first
+    }
+
+    func compactFrame(for screen: NSScreen) -> NSRect {
+        let count = max(1, model.desktops.count)
+        let width = max(130, CGFloat(count) * 16 + 32)
+        let islandHeight = max(28, screen.safeAreaInsets.top)
+        let height = islandHeight + 2
+        let targetX = screen.frame.midX - width / 2
+        return NSRect(x: targetX, y: screen.frame.maxY - height, width: width, height: height)
+    }
+
+    func expandedFrame(for screen: NSScreen) -> NSRect {
         let islandWidth = max(160, (screen.auxiliaryTopRightArea?.minX ?? 0) - (screen.auxiliaryTopLeftArea?.maxX ?? 0))
         let islandHeight = max(32, screen.safeAreaInsets.top)
-        let hotspotWidth = max(210, islandWidth + 26)
-        let hotspotHeight = islandHeight + 2
-        let hotspot = NSRect(x: screen.frame.midX - hotspotWidth / 2,
-                             y: screen.frame.maxY - hotspotHeight,
-                             width: hotspotWidth,
-                             height: hotspotHeight + 25)
+        let width = max(islandWidth + 36, CGFloat(model.desktops.count) * 47 + 26)
+        let height = islandHeight + 58
+        let targetX = screen.frame.midX - width / 2
+        return NSRect(x: targetX, y: screen.frame.maxY - height, width: width, height: height + 3)
+    }
 
-        if hotspot.contains(point) {
-            show(on: screen)
+    func handleSleep() {
+        animationID += 1
+        expanded = false
+        withAnimation(.none) {
+            state.isPresented = false
+        }
+        hideAfter = nil
+        panel.orderOut(nil)
+    }
+
+    func handleWakeOrScreenChange() {
+        animationID += 1
+        expanded = false
+        withAnimation(.none) {
+            state.isPresented = false
+        }
+        hideAfter = nil
+
+        // Re-assert window server collection behavior & level on the fresh display connection
+        panel.collectionBehavior = []
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        panel.level = .statusBar
+        panel.alphaValue = 1
+
+        if let screen = currentScreen() {
+            panel.setFrame(compactFrame(for: screen), display: true)
+            panel.orderFrontRegardless()
+        }
+
+        // Ensure tracking is active
+        restartTracking()
+    }
+
+    private func handleGlobalMouseMove(_ event: NSEvent) {
+        let point = NSEvent.mouseLocation
+        if NSScreen.screens.contains(where: {
+            point.x >= $0.frame.minX && point.x <= $0.frame.maxX &&
+            point.y >= $0.frame.maxY - 55
+        }) {
+            update()
+        }
+    }
+
+    func update() {
+        guard let screen = currentScreen() else { return }
+        let point = NSEvent.mouseLocation
+
+        let compact = compactFrame(for: screen)
+        let expandedRect = expandedFrame(for: screen)
+
+        // Hit testing:
+        // 1. Is point inside the resting compact frame? (generous inset)
+        let compactHit = compact.insetBy(dx: -25, dy: -10).contains(point)
+        // 2. Is point touching notch area or very top of screen?
+        let notchHit = abs(point.x - screen.frame.midX) <= 160 && point.y >= screen.frame.maxY - 42
+        let topEdgeHit = point.y >= screen.frame.maxY - 3
+        // 3. If expanded, is point within the expanded panel?
+        let expandedHit = expanded && expandedRect.insetBy(dx: -15, dy: -10).contains(point)
+
+        let shouldBeExpanded = compactHit || notchHit || topEdgeHit || expandedHit
+
+        if shouldBeExpanded {
             hideAfter = nil
-        } else if panel.isVisible && panel.frame.insetBy(dx: -10, dy: -6).contains(point) {
-            hideAfter = nil
-        } else if panel.isVisible {
-            if hideAfter == nil { hideAfter = Date().addingTimeInterval(0.05) }
+            if !expanded {
+                show(on: screen)
+            }
+        } else if expanded {
+            if hideAfter == nil {
+                hideAfter = Date().addingTimeInterval(0.45) // 450ms matching SpaceJump
+            }
             if hideAfter! <= Date() {
-                hide()
+                collapse(on: screen)
                 hideAfter = nil
             }
         }
     }
 
-    private func show(on screen: NSScreen) {
-        // macOS can order the panel out behind our back (sleep, display change), leaving expanded stuck true.
-        guard !expanded || !panel.isVisible else { return }
+    func show(on screen: NSScreen) {
+        guard !expanded else { return }
         expanded = true
-        let islandWidth = max(160, (screen.auxiliaryTopRightArea?.minX ?? 0) - (screen.auxiliaryTopLeftArea?.maxX ?? 0))
-        let islandHeight = max(32, screen.safeAreaInsets.top)
-        let width = max(islandWidth + 36, CGFloat(model.desktops.count) * 47 + 26)
-        let height = islandHeight + 55
-        let targetX = screen.frame.midX - width / 2
-        let frame = NSRect(x: targetX, y: screen.frame.maxY - height, width: width, height: height + 3)
         animationID += 1
-        panel.setFrame(frame, display: false)
+        panel.setFrame(expandedFrame(for: screen), display: true)
         if !panel.isVisible {
+            panel.collectionBehavior = []
+            panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            panel.level = .statusBar
             panel.alphaValue = 1
             panel.orderFrontRegardless()
         }
@@ -301,18 +456,63 @@ private final class HoverSwitcher {
         }
     }
 
-    private func hide() {
-        guard panel.isVisible, expanded else { return }
+    func collapse(on screen: NSScreen) {
+        guard expanded else { return }
         expanded = false
         animationID += 1
         let id = animationID
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+            state.isPresented = false
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self, self.animationID == id, !self.expanded else { return }
+            self.panel.setFrame(self.compactFrame(for: screen), display: true)
+        }
+    }
+
+    func selectDesktop(_ desktop: Desktop) {
+        expanded = false
+        hideAfter = nil
+        animationID += 1
         withAnimation(.easeOut(duration: 0.12)) {
             state.isPresented = false
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.13) { [weak self] in
-            guard let self, self.animationID == id, !self.expanded else { return }
-            self.panel.orderOut(nil)
+        if let screen = currentScreen() {
+            panel.setFrame(compactFrame(for: screen), display: true)
         }
+        mission.switchTo(desktop, model: model)
+    }
+}
+
+private struct DesktopBadgeButton: View {
+    let desktop: Desktop
+    let isCurrent: Bool
+    let name: String
+    let busy: Bool
+    let onSelect: () -> Void
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(spacing: 3) {
+                Text("\(desktop.number)")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .frame(width: 34, height: 34)
+                    .background(Color(nsColor: SpaceTint.color(for: desktop.number)).opacity(0.55), in: RoundedRectangle(cornerRadius: 9))
+                    .overlay {
+                        if isCurrent {
+                            RoundedRectangle(cornerRadius: 9).stroke(Color.white, lineWidth: 2)
+                        }
+                    }
+                Text(name)
+                    .font(.system(size: 10, weight: isCurrent ? .semibold : .regular))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.65)
+                    .frame(width: 42)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(busy || desktop.isFullscreen)
+        .accessibilityLabel("Switch to \(name)")
     }
 }
 
@@ -320,51 +520,72 @@ private struct IslandSwitcher: View {
     @ObservedObject var model: SpaceModel
     @ObservedObject var state: IslandState
     let mission: MissionControl
-    let dismiss: () -> Void
+    let onSelect: (Desktop) -> Void
 
     var body: some View {
+        ZStack(alignment: .top) {
+            if state.isPresented {
+                expandedView
+                    .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .top)))
+            } else {
+                compactView
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .preferredColorScheme(.dark)
+    }
+
+    private var compactView: some View {
+        HStack(spacing: 4) {
+            ForEach(model.desktops) { desktop in
+                if desktop.isCurrent {
+                    Text("\(desktop.number)")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .foregroundColor(.white)
+                        .frame(width: 18, height: 16)
+                        .background(Color(nsColor: SpaceTint.color(for: desktop.number)), in: RoundedRectangle(cornerRadius: 4))
+                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.8), lineWidth: 1))
+                } else {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color(nsColor: SpaceTint.color(for: desktop.number)).opacity(0.45))
+                        .frame(width: 6, height: 12)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(
+            Capsule()
+                .fill(Color.black.opacity(0.85))
+                .overlay(Capsule().stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+                .shadow(color: Color.black.opacity(0.35), radius: 4, x: 0, y: 2)
+        )
+        .padding(.top, 4)
+    }
+
+    private var expandedView: some View {
         VStack(spacing: 0) {
             Spacer(minLength: 32)
             HStack(spacing: 5) {
                 ForEach(model.desktops) { desktop in
-                    Button {
-                        dismiss()
-                        mission.switchTo(desktop, model: model)
-                    } label: {
-                        VStack(spacing: 3) {
-                            Text("\(desktop.number)")
-                                .font(.system(size: 14, weight: .semibold, design: .rounded))
-                                .frame(width: 34, height: 34)
-                                .background(Color(nsColor: SpaceTint.color(for: desktop.number)).opacity(0.55), in: RoundedRectangle(cornerRadius: 9))
-                                .overlay {
-                                    if desktop.isCurrent {
-                                        RoundedRectangle(cornerRadius: 9).stroke(.white, lineWidth: 2)
-                                    }
-                                }
-                            Text(model.name(desktop))
-                                .font(.system(size: 10, weight: desktop.isCurrent ? .semibold : .regular))
-                                .lineLimit(1)
-                                .minimumScaleFactor(0.65)
-                                .frame(width: 42)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(model.busy || desktop.isFullscreen)
-                    .accessibilityLabel("Switch to \(model.name(desktop))")
+                    DesktopBadgeButton(
+                        desktop: desktop,
+                        isCurrent: desktop.isCurrent,
+                        name: model.name(desktop),
+                        busy: model.busy,
+                        onSelect: { onSelect(desktop) }
+                    )
                 }
             }
             .padding(.bottom, 6)
         }
         .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
             IslandCardShape(bottomRadius: 18)
                 .fill(Color.black.opacity(0.92))
-                .shadow(color: .black.opacity(state.isPresented ? 0.35 : 0), radius: 10, x: 0, y: 6)
+                .shadow(color: Color.black.opacity(0.45), radius: 10, x: 0, y: 6)
         )
-        .offset(y: state.isPresented ? 0 : -95)
-        .opacity(state.isPresented ? 1 : 0)
-        .preferredColorScheme(.dark)
     }
 }
 
@@ -484,7 +705,39 @@ struct ContentView: View {
 
     private var spacesView: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 10)], spacing: 10) {
+            VStack(alignment: .leading, spacing: 14) {
+                if model.isMRUEnabled {
+                    HStack(spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                            .font(.system(size: 14))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Automatic Space Rearranging is Enabled")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Palette.text)
+                            Text("macOS automatically reorders Spaces based on most recent use, which causes Space numbers and positions to change when you jump.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Palette.muted)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Disable") {
+                            model.disableMRU()
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        Button("Settings") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.dock") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(12)
+                    .background(Color.yellow.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.yellow.opacity(0.3), lineWidth: 1))
+                }
+
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 10)], spacing: 10) {
                 ForEach(model.desktops) { desktop in
                     HStack(spacing: 10) {
                         SpaceBadge(number: desktop.number)
@@ -506,6 +759,7 @@ struct ContentView: View {
                 }
             }
             if model.desktops.isEmpty { Text("Desktops unavailable on this macOS build.").foregroundStyle(Palette.muted).padding() }
+            }
         }
     }
 
@@ -538,6 +792,16 @@ struct ContentView: View {
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1).help(window.title)
                         }
                         Spacer(minLength: 8)
+                        Button {
+                            SpaceSwitcher.shared.switchTo(window: window, desktops: model.desktops)
+                        } label: {
+                            Image(systemName: "arrow.up.forward.app")
+                                .font(.system(size: 13))
+                                .foregroundStyle(Palette.accent)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Focus window")
+                        .accessibilityLabel("Focus \(window.app): \(window.title)")
                         if model.parked[window.id] != nil { Image(systemName: "eye.slash").foregroundStyle(Palette.muted).help("Hidden") }
                         Picker("Workspace for \(window.app): \(window.title)", selection: Binding(get: { model.assignments[window.id] ?? "" }, set: { model.assign(window, to: $0.isEmpty ? nil : $0) })) {
                             Text("None").tag("")

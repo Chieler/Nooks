@@ -10,6 +10,7 @@ struct Desktop: Identifiable {
     let number: Int
     let isCurrent: Bool
     let isFullscreen: Bool
+    var pid: pid_t? = nil
     var fallbackName: String { isFullscreen ? "Full screen \(number)" : "Desktop \(number)" }
 }
 

@@ -12,6 +12,7 @@ final class SpaceModel: ObservableObject {
     @Published var hasAccess = AX.trusted
     @Published var busy = false
     @Published var parked: [String: ParkedWindow] = [:]
+    @Published var isMRUEnabled = false
     private let journal: URL
     private var recoveryReadable = true
     var menuChanged: (() -> Void)?
@@ -39,8 +40,30 @@ final class SpaceModel: ObservableObject {
 
     func refresh() {
         hasAccess = AX.trusted
+        checkMRU()
         refreshSpaces()
         windows = AX.windows()
+    }
+
+    func checkMRU() {
+        CFPreferencesAppSynchronize("com.apple.dock" as CFString)
+        if let val = CFPreferencesCopyAppValue("mru-spaces" as CFString, "com.apple.dock" as CFString) {
+            isMRUEnabled = (val as? Bool) ?? ((val as? NSNumber)?.boolValue ?? true)
+        } else {
+            isMRUEnabled = true
+        }
+    }
+
+    func disableMRU() {
+        CFPreferencesSetAppValue("mru-spaces" as CFString, kCFBooleanFalse, "com.apple.dock" as CFString)
+        CFPreferencesAppSynchronize("com.apple.dock" as CFString)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+        p.arguments = ["Dock"]
+        try? p.run()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.refresh()
+        }
     }
 
     func refreshSpaces() {
@@ -64,13 +87,16 @@ final class SpaceModel: ObservableObject {
             for (index, space) in ((display["Spaces"] as? [[String: Any]]) ?? []).enumerated() {
                 guard let id = space["id64"] as? NSNumber else { continue }
                 number += 1
+                let isFullscreen = (space["type"] as? NSNumber)?.intValue != 0
+                let pid = (space["pid"] as? NSNumber)?.int32Value
                 result.append(Desktop(id: id.uint64Value, uuid: space["uuid"] as? String ?? "", display: screen?.localizedName ?? identifier,
                                       displayIdentifier: resolvedIdentifier,
                                       displayID: displayID, index: index, number: number, isCurrent: current == id,
-                                      isFullscreen: (space["type"] as? NSNumber)?.intValue != 0))
+                                      isFullscreen: isFullscreen, pid: pid))
             }
         }
         desktops = result
+        SpaceSwitcher.shared.sync(with: result)
         menuChanged?()
     }
 
